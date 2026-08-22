@@ -120,6 +120,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
     with tempfile.TemporaryDirectory() as tmpdir:
         ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
         ime_pre_llvm_path = os.path.join(tmpdir, "ime-pre-llvm.mlir")
+        standard_pre_llvm_path = os.path.join(tmpdir, "pre-llvm.mlir")
         atomic_cas_path = os.path.join(tmpdir, "ttshared-atomic-cas.mlir")
         llmlir_path = os.path.join(tmpdir, "ll.mlir")
         llir_path = os.path.join(tmpdir, "ll.ir")
@@ -221,52 +222,87 @@ def _ttsharedir_to_llir(ttsharedir: str):
             # ---------------------------------------------------------------
             # Standard path: buddy-mlir vectorisation → host LLVM IR
             # ---------------------------------------------------------------
+            standard_lowering_passes = [
+                # Note: eliminate-empty-tensors fails when there are multiple func.return ops
+                # in a single kernel which are the results of early returns.
+                # See python/examples/test_early_return.py for examples.
+                # We disable this pass for now since performance on CPU isn't the main
+                # focus at the moment.
+                # "--eliminate-empty-tensors",
+                # Fuse tensor-level elementwise chains before bufferization
+                # turns every intermediate and scalar broadcast into a
+                # separate temporary buffer.
+                "--linalg-fuse-elementwise-ops",
+                "--empty-tensor-to-alloc-tensor",
+                "--one-shot-bufferize=allow-return-allocs-from-loops=true",
+                "--buffer-deallocation-pipeline",
+                "--eliminate-memref-copy",
+                # Triton programs commonly materialize small, statically
+                # sized tiles for loads and scalar broadcasts.  Paying for
+                # several heap allocations on every grid invocation
+                # dominates elementwise CPU kernels, so keep bounded tile
+                # temporaries in the launcher thread's stack frame.
+                "--promote-buffers-to-stack=max-alloc-size-in-bytes=65536",
+                "--matmul-vectorization",
+                "--convert-linalg-to-affine-loops",
+                "--lower-affine",
+                "--convert-linalg-to-loops",
+                "--expand-strided-metadata",
+                "--convert-scf-to-cf",
+            ]
+            llvm_lowering_passes = [
+                "--convert-arith-to-llvm",
+                "--convert-math-to-llvm",
+                "--convert-complex-to-llvm",
+                "--convert-vector-to-llvm",
+                "--convert-index-to-llvm",
+                "--memref-expand",
+                "--finalize-memref-to-llvm",
+                "--convert-cf-to-llvm",
+                "--convert-func-to-llvm",
+                # Lowering memrefs creates more affine.apply ops.
+                # Lowering these affine ops again creates further arith ops,
+                # so we have to run these two passes again here.
+                "--lower-affine",
+                "--convert-arith-to-llvm",
+                # Remove all unrealized casts created
+                "--reconcile-unrealized-casts",
+            ]
+
+            buddy_input_path = ttshared_path
+            buddy_passes = [*standard_lowering_passes, *llvm_lowering_passes]
+            if "__triton_shared_atomic_cas_" in ttsharedir:
+                # LLVM cmpxchg is not bufferizable, so lower helper calls only
+                # after Buddy has completed its tensor-to-memref work.
+                subprocess.check_call(
+                    [
+                        buddy_opt_path,
+                        ttshared_path,
+                        *standard_lowering_passes,
+                        "--mlir-print-debuginfo",
+                        "-o",
+                        standard_pre_llvm_path,
+                    ]
+                )
+                subprocess.check_call(
+                    [
+                        _get_triton_shared_opt_path(),
+                        standard_pre_llvm_path,
+                        "--lower-atomic-cas-to-llvm",
+                        "--canonicalize",
+                        "--mlir-print-debuginfo",
+                        "-o",
+                        atomic_cas_path,
+                    ]
+                )
+                buddy_input_path = atomic_cas_path
+                buddy_passes = llvm_lowering_passes
+
             subprocess.check_call(
                 [
                     buddy_opt_path,
-                    ttshared_path,
-                    # Note: eliminate-empty-tensors fails when there are multiple func.return ops
-                    # in a single kernel which are the results of early returns.
-                    # See python/examples/test_early_return.py for examples.
-                    # We disable this pass for now since performance on CPU isn't the main
-                    # focus at the moment.
-                    # "--eliminate-empty-tensors",
-                    # Fuse tensor-level elementwise chains before bufferization
-                    # turns every intermediate and scalar broadcast into a
-                    # separate temporary buffer.
-                    "--linalg-fuse-elementwise-ops",
-                    "--empty-tensor-to-alloc-tensor",
-                    "--one-shot-bufferize=allow-return-allocs-from-loops=true",
-                    "--buffer-deallocation-pipeline",
-                    "--eliminate-memref-copy",
-                    # Triton programs commonly materialize small, statically
-                    # sized tiles for loads and scalar broadcasts.  Paying for
-                    # several heap allocations on every grid invocation
-                    # dominates elementwise CPU kernels, so keep bounded tile
-                    # temporaries in the launcher thread's stack frame.
-                    "--promote-buffers-to-stack=max-alloc-size-in-bytes=65536",
-                    "--matmul-vectorization",
-                    "--convert-linalg-to-affine-loops",
-                    "--lower-affine",
-                    "--convert-linalg-to-loops",
-                    "--expand-strided-metadata",
-                    "--convert-scf-to-cf",
-                    "--convert-arith-to-llvm",
-                    "--convert-math-to-llvm",
-                    "--convert-complex-to-llvm",
-                    "--convert-vector-to-llvm",
-                    "--convert-index-to-llvm",
-                    "--memref-expand",
-                    "--finalize-memref-to-llvm",
-                    "--convert-cf-to-llvm",
-                    "--convert-func-to-llvm",
-                    # Lowering memrefs creates more affine.apply ops.
-                    # Lowering these affine ops again creates further arith ops,
-                    # so we have to run these two passes again here.
-                    "--lower-affine",
-                    "--convert-arith-to-llvm",
-                    # Remove all unrealized casts created
-                    "--reconcile-unrealized-casts",
+                    buddy_input_path,
+                    *buddy_passes,
                     "--mlir-print-debuginfo",
                     "-o",
                     llmlir_path,
@@ -303,6 +339,18 @@ def _enable_fadd_reassociation(llir: str) -> str:
     return _FADD_INSTRUCTION.sub(add_flag, llir)
 
 
+_ATOMIC_LLIR_MARKERS = (
+    "atomicrmw",
+    "cmpxchg",
+    "__triton_shared_atomic_cas_",
+)
+
+
+def _llir_contains_atomics(llir: str) -> bool:
+    """Return True when generated LLVM IR performs atomic memory updates."""
+    return any(marker in llir for marker in _ATOMIC_LLIR_MARKERS)
+
+
 def _optimize_llir(llir: str, options=None):
     # llc's -O3 controls code-generation optimizations but does not run the
     # target-aware LLVM middle-end pipeline.  In particular, scalar linalg
@@ -311,6 +359,13 @@ def _optimize_llir(llir: str, options=None):
     # leave cross-compiled IR untouched so its explicit target contract is
     # preserved by the RISC-V toolchain below.
     host_machine = platform.machine()
+
+    # scatter_reduce (sum/mean/prod/amax/amin) lowers to atomicrmw/cmpxchg.
+    # LLVM's loop vectorizer must not rewrite these loops on RISC-V; doing so
+    # has been observed to corrupt memory and abort inside the CPU launcher.
+    if host_machine == "riscv64" and _llir_contains_atomics(llir):
+        return llir
+
     if host_machine not in {"x86_64", "AMD64", "riscv64"} or getattr(
         options, "target_triple", None
     ):
