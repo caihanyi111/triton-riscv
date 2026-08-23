@@ -121,6 +121,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
         ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
         ime_pre_llvm_path = os.path.join(tmpdir, "ime-pre-llvm.mlir")
         standard_pre_llvm_path = os.path.join(tmpdir, "pre-llvm.mlir")
+        pre_llvm_transformed_path = os.path.join(tmpdir, "pre-llvm-transformed.mlir")
         atomic_cas_path = os.path.join(tmpdir, "ttshared-atomic-cas.mlir")
         llmlir_path = os.path.join(tmpdir, "ll.mlir")
         llir_path = os.path.join(tmpdir, "ll.ir")
@@ -243,13 +244,18 @@ def _ttsharedir_to_llir(ttsharedir: str):
                 # dominates elementwise CPU kernels, so keep bounded tile
                 # temporaries in the launcher thread's stack frame.
                 "--promote-buffers-to-stack=max-alloc-size-in-bytes=65536",
-                "--matmul-vectorization",
+            ]
+            if platform.machine() != "riscv64":
+                standard_lowering_passes.append("--matmul-vectorization")
+            standard_lowering_passes.extend(
+                [
                 "--convert-linalg-to-affine-loops",
                 "--lower-affine",
                 "--convert-linalg-to-loops",
                 "--expand-strided-metadata",
                 "--convert-scf-to-cf",
-            ]
+                ]
+            )
             llvm_lowering_passes = [
                 "--convert-arith-to-llvm",
                 "--convert-math-to-llvm",
@@ -270,40 +276,39 @@ def _ttsharedir_to_llir(ttsharedir: str):
                 "--reconcile-unrealized-casts",
             ]
 
-            buddy_input_path = ttshared_path
-            buddy_passes = [*standard_lowering_passes, *llvm_lowering_passes]
-            if "__triton_shared_atomic_cas_" in ttsharedir:
-                # LLVM cmpxchg is not bufferizable, so lower helper calls only
-                # after Buddy has completed its tensor-to-memref work.
-                subprocess.check_call(
-                    [
-                        buddy_opt_path,
-                        ttshared_path,
-                        *standard_lowering_passes,
-                        "--mlir-print-debuginfo",
-                        "-o",
-                        standard_pre_llvm_path,
-                    ]
-                )
-                subprocess.check_call(
-                    [
-                        _get_triton_shared_opt_path(),
-                        standard_pre_llvm_path,
-                        "--lower-atomic-cas-to-llvm",
-                        "--canonicalize",
-                        "--mlir-print-debuginfo",
-                        "-o",
-                        atomic_cas_path,
-                    ]
-                )
-                buddy_input_path = atomic_cas_path
-                buddy_passes = llvm_lowering_passes
-
+            # Bufferize on Buddy first, then run triton-shared transforms that must
+            # see memref form (atomic CAS, FP8 extf/truncf expansion) before LLVM.
             subprocess.check_call(
                 [
                     buddy_opt_path,
-                    buddy_input_path,
-                    *buddy_passes,
+                    ttshared_path,
+                    *standard_lowering_passes,
+                    "--mlir-print-debuginfo",
+                    "-o",
+                    standard_pre_llvm_path,
+                ]
+            )
+            pre_llvm_transform_passes = ["--expand-float8-conversions"]
+            if "__triton_shared_atomic_cas_" in ttsharedir:
+                # LLVM cmpxchg is not bufferizable, so lower helper calls only
+                # after Buddy has completed its tensor-to-memref work.
+                pre_llvm_transform_passes.insert(0, "--lower-atomic-cas-to-llvm")
+            subprocess.check_call(
+                [
+                    _get_triton_shared_opt_path(),
+                    standard_pre_llvm_path,
+                    *pre_llvm_transform_passes,
+                    "--canonicalize",
+                    "--mlir-print-debuginfo",
+                    "-o",
+                    pre_llvm_transformed_path,
+                ]
+            )
+            subprocess.check_call(
+                [
+                    buddy_opt_path,
+                    pre_llvm_transformed_path,
+                    *llvm_lowering_passes,
                     "--mlir-print-debuginfo",
                     "-o",
                     llmlir_path,
@@ -387,6 +392,61 @@ def _llir_contains_llvm_math_intrinsics(llir: str) -> bool:
     return any(marker in llir for marker in _LLVM_MATH_INTRINSIC_MARKERS)
 
 
+def _llir_contains_llvm_vector_dot_ops(llir: str) -> bool:
+    """Return True when LLVM loop vectorization lowered dot accumulators to vectors."""
+    return "@llvm.fmuladd.v" in llir
+
+
+_DOT_KERNEL_NAME_MARKERS = (
+    "matmul",
+    "gemm",
+    "dot",
+    "logits",
+    "_mm",
+)
+
+
+def _llir_contains_dot_reduction(llir: str) -> bool:
+    """Return True for matmul/dot kernels whose K-reduction loops miscompile on RVV."""
+    name_match = re.search(r"define void @(\w+)", llir)
+    if name_match:
+        name = name_match.group(1).lower()
+        if any(marker in name for marker in _DOT_KERNEL_NAME_MARKERS):
+            return True
+    fmul_count = len(re.findall(r"=\s*fmul float", llir))
+    fadd_count = len(re.findall(r"=\s*fadd float", llir))
+    return fmul_count >= 4 and fadd_count >= 4
+
+
+def _llir_is_simple_store_only_kernel(llir: str) -> bool:
+    """Return True for pure store/fill loops that miscompile under RVV on riscv64.
+
+    Kernels like fill_neg_inf only emit masked stores of a constant (e.g. -inf)
+    with no floating-point arithmetic. They do not match dot/libm/atomic
+    heuristics but still take the RVV loop-vectorizer path and can corrupt
+    memory or abort during launcher .so teardown on riscv64.
+    """
+    name_match = re.search(r"define void @(\w+)", llir)
+    if name_match:
+        name = name_match.group(1).lower()
+        if "fill" in name or "neg_inf" in name:
+            return True
+
+    fmul_count = len(re.findall(r"=\s*fmul float", llir))
+    fadd_count = len(re.findall(r"=\s*fadd float", llir))
+    fcmp_count = len(re.findall(r"=\s*fcmp ", llir))
+    call_count = len(re.findall(r"=\s*call ", llir))
+    store_count = len(re.findall(r"=\s*store ", llir))
+
+    return (
+        store_count >= 1
+        and fmul_count == 0
+        and fadd_count == 0
+        and fcmp_count == 0
+        and call_count == 0
+    )
+
+
 def _llir_contains_atomics(llir: str) -> bool:
     """Return True when generated LLVM IR performs atomic memory updates."""
     return any(marker in llir for marker in _ATOMIC_LLIR_MARKERS)
@@ -395,13 +455,18 @@ def _llir_contains_atomics(llir: str) -> bool:
 def _llir_needs_scalar_riscv_codegen(llir: str) -> bool:
     """Return True when riscv64 codegen must avoid LLVM loop vectorization.
 
-    Atomic updates, libm calls, and LLVM math intrinsics do not survive RVV loop
-    vectorization in the current launcher pipeline (wrong results or segfaults).
+    Atomic updates, libm calls, LLVM math intrinsics, vectorized dot
+    accumulators, and simple store-only loops do not survive RVV loop
+    vectorization in the current launcher pipeline (wrong results, heap
+    corruption, or segfaults).
     """
     return (
         _llir_contains_atomics(llir)
         or _llir_contains_libm_calls(llir)
         or _llir_contains_llvm_math_intrinsics(llir)
+        or _llir_contains_llvm_vector_dot_ops(llir)
+        or _llir_contains_dot_reduction(llir)
+        or _llir_is_simple_store_only_kernel(llir)
     )
 
 
