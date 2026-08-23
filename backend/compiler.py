@@ -405,12 +405,21 @@ _DOT_KERNEL_NAME_MARKERS = (
     "_mm",
 )
 
+# Elementwise norms/reductions can contain many fmul/fadd without being matmul.
+_DOT_REDUCTION_EXCLUDED_NAME_MARKERS = (
+    "euclidean",
+    "fill",
+    "neg_inf",
+)
+
 
 def _llir_contains_dot_reduction(llir: str) -> bool:
     """Return True for matmul/dot kernels whose K-reduction loops miscompile on RVV."""
     name_match = re.search(r"define void @(\w+)", llir)
     if name_match:
         name = name_match.group(1).lower()
+        if any(marker in name for marker in _DOT_REDUCTION_EXCLUDED_NAME_MARKERS):
+            return False
         if any(marker in name for marker in _DOT_KERNEL_NAME_MARKERS):
             return True
     fmul_count = len(re.findall(r"=\s*fmul float", llir))
@@ -452,20 +461,26 @@ def _llir_contains_atomics(llir: str) -> bool:
     return any(marker in llir for marker in _ATOMIC_LLIR_MARKERS)
 
 
-def _llir_needs_scalar_riscv_codegen(llir: str) -> bool:
+def _llir_needs_scalar_riscv_codegen(llir: str, *, for_cross_compile: bool = False) -> bool:
     """Return True when riscv64 codegen must avoid LLVM loop vectorization.
 
     Atomic updates, libm calls, LLVM math intrinsics, vectorized dot
     accumulators, and simple store-only loops do not survive RVV loop
     vectorization in the current launcher pipeline (wrong results, heap
     corruption, or segfaults).
+
+    Cross-compiled RISC-V objects only disable RVV for atomics and dot/matmul
+    kernels so elementwise loops (e.g. euclidean distance) can still vectorize
+    even when they end in a scalar math intrinsic such as @llvm.sqrt.
     """
+    if _llir_contains_atomics(llir) or _llir_contains_dot_reduction(llir):
+        return True
+    if for_cross_compile:
+        return False
     return (
-        _llir_contains_atomics(llir)
-        or _llir_contains_libm_calls(llir)
+        _llir_contains_libm_calls(llir)
         or _llir_contains_llvm_math_intrinsics(llir)
         or _llir_contains_llvm_vector_dot_ops(llir)
-        or _llir_contains_dot_reduction(llir)
         or _llir_is_simple_store_only_kernel(llir)
     )
 
@@ -475,26 +490,36 @@ def _optimize_llir(llir: str, options=None):
     # target-aware LLVM middle-end pipeline.  In particular, scalar linalg
     # loops emitted for elementwise Triton tiles remain scalar unless opt sees
     # the host vector width.  Run the native O3 pipeline for host x86 builds;
-    # leave cross-compiled IR untouched so its explicit target contract is
-    # preserved by the RISC-V toolchain below.
+    # for cross-compiled RISC-V objects, run opt with the explicit target
+    # triple so loop vectorization can emit RVV instructions.
     host_machine = platform.machine()
+    target_triple = getattr(options, "target_triple", None) if options else None
+    target_features = getattr(options, "target_features", None) if options else None
+    cross_compile_riscv = bool(target_triple)
 
     # scatter_reduce lowers to atomicrmw/cmpxchg; math kernels lower to libm
     # (@erff, etc.) or LLVM intrinsics (@llvm.exp.f32, etc.). Skip LLVM opt RVV
     # loop vectorization on riscv64 for these kernels; llc must also disable
     # loop vectorization (see _llir_to_bin).
-    if host_machine == "riscv64" and _llir_needs_scalar_riscv_codegen(llir):
-        return llir
-
-    if host_machine not in {"x86_64", "AMD64", "riscv64"} or getattr(
-        options, "target_triple", None
+    if (host_machine == "riscv64" or cross_compile_riscv) and _llir_needs_scalar_riscv_codegen(
+        llir, for_cross_compile=cross_compile_riscv
     ):
         return llir
 
-    if getattr(options, "allow_fp_reassoc", False):
+    if not cross_compile_riscv and host_machine not in {
+        "x86_64",
+        "AMD64",
+        "riscv64",
+    }:
+        return llir
+
+    if getattr(options, "allow_fp_reassoc", False) or cross_compile_riscv:
         # Per-kernel opt-in for reduction-heavy code whose numerical contract
         # permits reassociation. LLVM otherwise preserves scalar accumulation
-        # order and cannot vectorize these loops.
+        # order and cannot vectorize these loops. Cross-compiled RISC-V objects
+        # also need reassociation so elementwise reduction kernels (e.g.
+        # euclidean distance) can loop-vectorize to RVV instead of fully
+        # unrolling small trip counts.
         llir = _enable_fadd_reassociation(llir)
 
     # The launcher constructs unranked-memref descriptors on its stack and
@@ -554,7 +579,20 @@ def _optimize_llir(llir: str, options=None):
         dst_path = os.path.join(tmpdir, "kernel-opt.ll")
         Path(src_path).write_text(llir)
         command = [_get_llvm_bin_path("opt"), "-O3"]
-        if host_machine in {"x86_64", "AMD64"}:
+        if cross_compile_riscv:
+            command.extend(
+                [
+                    f"-mtriple={target_triple}",
+                    f"-mattr={target_features or DEFAULT_LLC_FEATURES}",
+                    "-riscv-v-vector-bits-min=128",
+                    "-riscv-v-vector-bits-max=128",
+                    # Keep small trip-count loops (e.g. BLOCK_D=16 tiles) for
+                    # the loop vectorizer instead of fully unrolling them to
+                    # scalar fsub/fmul/fadd before llc can emit RVV.
+                    "--unroll-threshold=0",
+                ]
+            )
+        elif host_machine in {"x86_64", "AMD64"}:
             command.extend(
                 [
                     "-mtriple=x86_64-unknown-linux-gnu",

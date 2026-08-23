@@ -62,8 +62,10 @@ def test_euclidean_dist_kernel_emits_riscv_object(tmp_path, N, M, D):
     )
     assert re.search(r"<_euclidean_dist_kernel>:", asm)
     assert re.search(r"\bvsetivli\b", asm)
-    assert re.search(r"\bvle32\.v\b", asm)
-    assert re.search(r"\bvse32\.v\b", asm)
+    # LLVM may emit whole-register vector loads/stores (vl2re32/vs2r) or
+    # unit-stride memory ops (vle32/vse32) depending on the lowered GEP shape.
+    assert re.search(r"\bvle(?:32|64)\.v\b|\bvl2re(?:32|64)\.v\b", asm)
+    assert re.search(r"\bvse(?:32|64)\.v\b|\bvs(?:2|4)r\.v\b", asm)
     assert re.search(r"\bvfsub\.vv\b", asm)
     assert re.search(r"\bvfmul\.vv\b", asm)
 
