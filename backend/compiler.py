@@ -253,6 +253,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
             llvm_lowering_passes = [
                 "--convert-arith-to-llvm",
                 "--convert-math-to-llvm",
+                "--convert-math-to-libm",
                 "--convert-complex-to-llvm",
                 "--convert-vector-to-llvm",
                 "--convert-index-to-llvm",
@@ -346,9 +347,37 @@ _ATOMIC_LLIR_MARKERS = (
 )
 
 
+_LIBM_LLIR_MARKERS = (
+    "@erff",
+    "@erf",
+    "@sinhf",
+    "@sinh",
+    "@expf",
+    "@exp",
+    "@logf",
+    "@log",
+    "@tanhf",
+    "@tanh",
+)
+
+
+def _llir_contains_libm_calls(llir: str) -> bool:
+    """Return True when LLVM IR calls libm helpers from convert-math-to-libm."""
+    return any(marker in llir for marker in _LIBM_LLIR_MARKERS)
+
+
 def _llir_contains_atomics(llir: str) -> bool:
     """Return True when generated LLVM IR performs atomic memory updates."""
     return any(marker in llir for marker in _ATOMIC_LLIR_MARKERS)
+
+
+def _llir_needs_scalar_riscv_codegen(llir: str) -> bool:
+    """Return True when riscv64 codegen must avoid LLVM loop vectorization.
+
+    Atomic updates and external libm calls do not survive RVV loop vectorization
+    in the current launcher pipeline (wrong results or segfaults).
+    """
+    return _llir_contains_atomics(llir) or _llir_contains_libm_calls(llir)
 
 
 def _optimize_llir(llir: str, options=None):
@@ -360,10 +389,10 @@ def _optimize_llir(llir: str, options=None):
     # preserved by the RISC-V toolchain below.
     host_machine = platform.machine()
 
-    # scatter_reduce (sum/mean/prod/amax/amin) lowers to atomicrmw/cmpxchg.
-    # LLVM's loop vectorizer must not rewrite these loops on RISC-V; doing so
-    # has been observed to corrupt memory and abort inside the CPU launcher.
-    if host_machine == "riscv64" and _llir_contains_atomics(llir):
+    # scatter_reduce lowers to atomicrmw/cmpxchg; math kernels lower to libm
+    # (@erff, etc.). Skip LLVM opt RVV loop vectorization on riscv64 for these
+    # kernels; llc must also disable loop vectorization (see _llir_to_bin).
+    if host_machine == "riscv64" and _llir_needs_scalar_riscv_codegen(llir):
         return llir
 
     if host_machine not in {"x86_64", "AMD64", "riscv64"} or getattr(
@@ -689,13 +718,29 @@ def _llir_to_bin(llir: str, metadata, options=None):
                 )
                 llc_args = toolchain.llc_command(llc_path, src_path, dst_path)
             elif platform.machine() == "riscv64":
-                llc_args.extend(
-                    [
+                if _llir_needs_scalar_riscv_codegen(llir):
+                    # Pure scalar codegen for libm/atomic kernels: RVV vlen
+                    # hints and -O3 loop opts still miscompile erff/atomic loops.
+                    llc_args = [
+                        llc_path,
+                        src_path,
+                        "-filetype=obj",
+                        "-O2",
+                        "-relocation-model=pic",
                         f"-mattr={DEFAULT_LLC_FEATURES}",
-                        "-riscv-v-vector-bits-min=128",
-                        "-riscv-v-vector-bits-max=128",
+                        "-vectorize-loops=false",
+                        "-vectorize-slp=false",
+                        "-o",
+                        dst_path,
                     ]
-                )
+                else:
+                    llc_args.extend(
+                        [
+                            f"-mattr={DEFAULT_LLC_FEATURES}",
+                            "-riscv-v-vector-bits-min=128",
+                            "-riscv-v-vector-bits-max=128",
+                        ]
+                    )
             elif platform.machine() in {"x86_64", "AMD64"}:
                 llc_args.extend(["-mcpu=native"])
             subprocess.check_call(llc_args)

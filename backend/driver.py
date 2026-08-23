@@ -80,8 +80,11 @@ def _append_openmp_link_args(subprocess_args):
 def _append_vector_math_link_args(subprocess_args):
     # LLVM's LIBMVEC vector-library mapping emits glibc vector ABI symbols such
     # as _ZGVdN8v_expf. Link them explicitly into the generated launcher.
-    if platform.system() == "Linux" and platform.machine() in {"x86_64", "AMD64"}:
-        subprocess_args.append("-lmvec")
+    # convert-math-to-libm emits erff/erf/sinhf/etc.; link libm on all Linux hosts.
+    if platform.system() == "Linux":
+        if platform.machine() in {"x86_64", "AMD64"}:
+            subprocess_args.append("-lmvec")
+        subprocess_args.append("-lm")
     return subprocess_args
 
 
